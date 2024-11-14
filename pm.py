@@ -42,8 +42,10 @@ from knn_cuda import KNN
 from pointnet2_ops import pointnet2_utils
 from functools import partial
 
-from timm.models.layers import trunc_normal_
-from timm.models.layers import DropPath
+#from timm.models.layers import trunc_normal_
+#from timm.models.layers import DropPath
+from timm.layers import trunc_normal_
+from timm.layers import DropPath
 
 from mamba_ssm import Mamba
 
@@ -343,152 +345,6 @@ class MixerModel(th.nn.Module):
 
         return hidden_states
 
-class PointMamba(th.nn.Module):
-    def __init__(self, config, **kwargs):
-        super(PointMamba, self).__init__()
-        self.config = config
-
-        self.trans_dim = config.model.trans_dim
-        self.depth = config.model.depth
-        self.cls_dim = config.model.cls_dim
-        self.reg_dim = config.model.reg_dim
-
-        self.group_size = config.model.group_size
-        self.num_group = config.model.num_group
-        self.encoder_dims = config.model.encoder_dims
-        self.encoder_feature = config.model.encoder_feature
-        self.input_channel = config.model.in_channel
-        self.emb_dim = config.model.emb_dim
-        self.fine_dim = config.model.fine_dim
-        self.model_args=config.model._asdict()
-
-        self.group_divider = Group(input_channel=self.input_channel, num_group=self.num_group, group_size=self.group_size)
-
-        self.encoder = Encoder(input_channel=self.input_channel, encoder_channel=self.encoder_dims, num_feature=self.encoder_feature)
-
-        self.use_cls_token = False if not hasattr(self.model_args, "use_cls_token") else self.model_args['use_cls_token']
-        self.drop_path = 0. if not hasattr(self.model_args, "drop_path") else self.model_args['drop_path']
-        self.rms_norm = False if not hasattr(self.model_args, "rms_norm") else self.model_args['rms_norm']
-        self.drop_out_in_block = 0. if not hasattr(self.model_args, "drop_out_in_block") else self.model_args['drop_out_in_block']
-
-        if self.use_cls_token:
-            self.cls_token = th.nn.Parameter(th.zeros(1, 1, self.trans_dim))
-            self.cls_pos = th.nn.Parameter(th.randn(1, 1, self.trans_dim))
-            trunc_normal_(self.cls_token, std=.02)
-            trunc_normal_(self.cls_pos, std=.02)
-
-        self.pos_embed = th.nn.Sequential(
-            th.nn.Linear(self.input_channel, self.emb_dim),
-            th.nn.GELU(),
-            th.nn.Linear(self.emb_dim, self.trans_dim)
-        )
-
-        self.blocks = MixerModel(d_model=self.trans_dim,
-                                 n_layer=self.depth,
-                                 rms_norm=self.rms_norm,
-                                 drop_out_in_block=self.drop_out_in_block,
-                                 drop_path=self.drop_path)
-
-        self.norm = th.nn.LayerNorm(self.trans_dim)
-
-        self.HEAD_CHANEL = 1
-        if self.use_cls_token:
-            self.HEAD_CHANEL += 1
-        self.head_finetune = th.nn.Sequential(
-            th.nn.Linear(self.trans_dim * self.HEAD_CHANEL, self.fine_dim),
-            th.nn.BatchNorm1d(self.fine_dim),
-            th.nn.ReLU(inplace=True),
-            th.nn.Dropout(0.3),
-            th.nn.Linear(self.fine_dim, self.fine_dim),
-            th.nn.BatchNorm1d(self.fine_dim),
-            th.nn.ReLU(inplace=True),
-            th.nn.Dropout(0.3),
-        )
-        self.cls_head = th.nn.Linear(self.fine_dim, self.cls_dim)
-        if self.reg_dim>0:
-          self.reg_head = th.nn.Linear(self.fine_dim, self.reg_dim)
-        else:
-          self.reg_head = None
-
-        self.build_loss_func()
-
-        self.drop_out = th.nn.Dropout(config['drop_out']) if "drop_out" in config else th.nn.Dropout(0)
-
-    def build_loss_func(self):
-        self.loss_ce = th.nn.CrossEntropyLoss()
-        self.loss_mse = th.nn.MSELoss()
-
-    """def get_loss_acc(self, ret, gt):
-        loss = self.loss_ce(ret, gt)
-        pred = ret.argmax(-1)
-        acc = (pred == gt[:,0]).sum() / float(gt.size(1))
-        return loss, acc * 100"""
-    def get_loss(self, output, target):
-        loss1 = self.loss_ce(output[0], target[0])
-        loss2 = self.loss_mse(output[1],target[1])
-        loss=loss1+loss2
-        return loss
-
-    def get_loss_acc(self, ret, gt):
-        loss1 = self.loss_ce(ret[0], gt[0])
-        pred = ret[0].argmax(-1)
-        acc = (pred == gt[0][:,0]).sum() / float(gt[0].size(1))
-        loss2 = self.loss_mse(ret[1],gt[1])
-        loss=loss1+loss2*10
-        return loss, acc * 100
-
-    def _init_weights(self, m):
-        if isinstance(m, th.nn.Linear):
-            trunc_normal_(m.weight, std=.02)
-            if isinstance(m, th.nn.Linear) and m.bias is not None:
-                th.nn.init.constant_(m.bias, 0)
-        elif isinstance(m, th.nn.LayerNorm):
-            th.nn.init.constant_(m.bias, 0)
-            th.nn.init.constant_(m.weight, 1.0)
-        elif isinstance(m, th.nn.Conv1d):
-            trunc_normal_(m.weight, std=.02)
-            if m.bias is not None:
-                th.nn.init.constant_(m.bias, 0)
-
-    def forward(self, pts):
-        neighborhood, center = self.group_divider(pts)
-        group_input_tokens = self.encoder(neighborhood)  # B G N
-        pos = self.pos_embed(center)
-
-        # reordering strategy
-        center_bond=[]
-        group_input_tokens_bond=[]
-        pos_bond=[]
-        for i in range(self.input_channel):
-            center_bond.append(center[:, :, i].argsort(dim=-1)[:, :, None])
-            group_input_tokens_bond.append(group_input_tokens.gather(dim=1, index=th.tile(center_bond[i], (1, 1, group_input_tokens.shape[-1]))))
-            pos_bond.append(pos.gather(dim=1, index=th.tile(center_bond[i], (1, 1, pos.shape[-1]))))
-        group_input_tokens = th.cat(group_input_tokens_bond, dim=1)
-        pos = th.cat(pos_bond, dim=1)
-        #center_y = center[:, :, 1].argsort(dim=-1)[:, :, None]
-        #center_z = center[:, :, 2].argsort(dim=-1)[:, :, None]
-        #group_input_tokens_y = group_input_tokens.gather(dim=1, index=th.tile(center_y, (1, 1, group_input_tokens.shape[-1])))
-        #group_input_tokens_z = group_input_tokens.gather(dim=1, index=th.tile(center_z, (1, 1, group_input_tokens.shape[-1])))
-        #pos_y = pos.gather(dim=1, index=th.tile(center_y, (1, 1, pos.shape[-1])))
-        #pos_z = pos.gather(dim=1, index=th.tile(center_z, (1, 1, pos.shape[-1])))
-        #group_input_tokens = th.cat([group_input_tokens_x, group_input_tokens_y, group_input_tokens_z], dim=1)
-        #pos = th.cat([pos_x, pos_y, pos_z], dim=1)
-
-        x = group_input_tokens
-        # transformer
-        x = self.drop_out(x)
-        #print("xpos",x.shape,pos.shape)
-        x = self.blocks(x+pos)
-        x = self.norm(x)
-        concat_f = x[:, :].mean(1)
-        ret = self.head_finetune(concat_f)
-        ret1 = self.cls_head(ret)
-        if(self.reg_head is not None):
-          ret2 = self.reg_head(ret)
-          return ret1, ret2
-        else:
-          return ret1
-
 class PointMODE(th.nn.Module):
     def __init__(self, config, **kwargs):
         super(PointMODE, self).__init__()
@@ -509,7 +365,9 @@ class PointMODE(th.nn.Module):
         if(self.emb_dim==0):
             self.emb_dim=None
         self.fine_dim = config.model.fine_dim
+        self.last_dim = config.model.last_dim
         self.model_args=config.model._asdict()
+        self.weight = th.nn.Parameter(th.ones(1+self.reg_dim)).to("cuda")
 
         self.num_point=config.num_point
         if(self.name=="Mamba"):
@@ -583,14 +441,29 @@ class PointMODE(th.nn.Module):
             #th.nn.ReLU(inplace=True),
             #th.nn.Dropout(0.3),
         )
-        self.cls_head = th.nn.Linear(self.fine_dim, self.cls_dim)
+        self.head_tune = th.nn.Linear(self.fine_dim, self.last_dim)
+        self.cls_head = th.nn.Linear(self.last_dim, self.cls_dim)
+        #= th.nn.Linear(self.last_dim, self.reg_dim)
+        self.reg_head0 = None
+        self.reg_head1 = None
+        self.reg_head2 = None
+        self.reg_head3 = None
+        self.reg_head4 = None
+        self.reg_head5 = None
         if self.reg_dim>0:
-          self.reg_head = th.nn.Linear(self.fine_dim, self.reg_dim)
-        else:
-          self.reg_head = None
+          self.reg_head0=th.nn.Linear(self.last_dim, 1,device="cuda")
+        if self.reg_dim>1:
+          self.reg_head1=th.nn.Linear(self.last_dim, 1,device="cuda")
+        if self.reg_dim>2:
+          self.reg_head2=th.nn.Linear(self.last_dim, 1,device="cuda")
+        if self.reg_dim>3:
+          self.reg_head3=th.nn.Linear(self.last_dim, 1,device="cuda")
+        if self.reg_dim>4:
+          self.reg_head4=th.nn.Linear(self.last_dim, 1,device="cuda")
+        if self.reg_dim>5:
+          self.reg_head5=th.nn.Linear(self.last_dim, 1,device="cuda")
 
         self.build_loss_func()
-
         self.drop_out = th.nn.Dropout(config['drop_out']) if "drop_out" in config else th.nn.Dropout(0)
 
     def build_loss_func(self):
@@ -598,13 +471,46 @@ class PointMODE(th.nn.Module):
         self.loss_mse = th.nn.MSELoss()
         self.loss_sml1 = th.nn.SmoothL1Loss(beta=0.1)
 
+    def get_losses(self, output, target,norm=False):
+        losses= [self.loss_ce(output[0], target[0])]
+        #loss2 = self.loss_sml1(output[1],target[1])
+        if(len(target[1][0])>0):
+            for i in range(len(target[1][0])):
+                losses.append(self.loss_sml1(output[i+1].ravel(),target[1][:,i]))
+        tm=[]
+        if norm:
+            for i in range(len(losses)):
+                tm.append(th.max(th.abs(output[i])))
+            tm_sum=sum(tm)
+            for i in range(len(losses)):
+                losses[i]=losses[i]*tm_sum/(tm[i]+1)
+        return losses
+
+    def gradnorm_loss(self,output,target,alpha=0.001):
+        losses=self.get_losses(output,target)
+        weighted_loss=[self.weight[i].detach()*losses[i] for i in range(len(self.weight))]
+        total_loss=sum(weighted_loss)
+        gw=[]
+        for i in range(len(self.weight)):
+            dl=th.autograd.grad(self.weight[i]*losses[i],self.head_tune.parameters(),retain_graph=True,create_graph=True)
+            grad_norm = th.norm(th.stack([g.norm(2) for g in dl if g is not None]))
+            #gw.append(th.norm(dl))
+            gw.append(grad_norm)
+        total_loss.backward(retain_graph=True)
+        mean_grad_norm = sum(gw)/len(gw)
+        for i in range(len(self.weight)):
+            self.weight.data[i]*=(gw[i]/mean_grad_norm).pow(alpha)
+            if(i==0):self.weight.data[i]=max(self.weight[i].item(),0.2)
+            else:self.weight.data[i]=max(self.weight[i].item(),0.05)
+        with th.no_grad():
+            self.weight/=self.weight.sum()
+
+        return total_loss
 
     def get_loss(self, output, target):
-        loss1 = self.loss_ce(output[0], target[0])
-        loss2 = self.loss_sml1(output[1],target[1])
-        if(loss2<.1):loss=loss1+loss2*2
-        else:loss=loss1+loss2*1
-        return loss
+        losses=self.get_losses(output,target)
+        total_loss=sum(losses)
+        return total_loss
 
     def _init_weights(self, m):
         if isinstance(m, th.nn.Linear):
@@ -651,10 +557,28 @@ class PointMODE(th.nn.Module):
             input_tokens = self.encoder(pts)
             x = self.blocks(input_tokens)
             ret = self.head_finetune(x)
+        ret = self.head_tune(ret)
         ret1 = self.cls_head(ret)
-        if(self.reg_head is not None):
-          ret2 = self.reg_head(ret)
-          return ret1, ret2
+        if(self.reg_head0 is not None):
+          red0=None
+          red1=None
+          red2=None
+          red3=None
+          red4=None
+          red5=None
+          if(self.reg_head0 is not None):
+              red0=self.reg_head0(ret)
+          if(self.reg_head1 is not None):
+              red1=self.reg_head1(ret)
+          if(self.reg_head2 is not None):
+              red2=self.reg_head2(ret)
+          if(self.reg_head3 is not None):
+              red3=self.reg_head3(ret)
+          if(self.reg_head4 is not None):
+              red4=self.reg_head4(ret)
+          if(self.reg_head5 is not None):
+              red5=self.reg_head5(ret)
+          return ret1,red0,red1,red2,red3,red4,red5
         else:
           return ret1
 
@@ -698,6 +622,7 @@ model:
   encoder_dims: {args.encoder_dim}
   encoder_feature: {args.encoder_dim}
   fine_dim: 256
+  last_dim: 64
   rms_norm: False
   drop_path: 0.2
   drop_out: 0.1
@@ -740,6 +665,7 @@ model:
         print(f"train {len(train_dataset)} validation {len(val_dataset)}")
         best_loss=1.
         early_stop=0
+        epoch_min=args.epoch_min
         for epoch in range(200):
             net.train()
             th.set_grad_enabled(True)
@@ -800,7 +726,7 @@ model:
                 continue
             if epoch % 10 == 9 and epoch<20:
                 th.save({'net':net.state_dict(),'optimizer':optim.state_dict(),'vloss':vloss/n_val,'epoch':epoch,'metrics':metric.state_dict(),'config':config},f'save/ckpt-{name}-{epoch:03d}.pth')
-            if(epoch>20 and early_stop>4):break
+            if(epoch>epoch_min and early_stop>4):break
             #bar.close()
     if(args.eval):
         net.load_state_dict(tl['net'])

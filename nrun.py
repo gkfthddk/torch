@@ -8,6 +8,7 @@ if __name__== '__main__':
     parser=argparse.ArgumentParser()
     parser.add_argument("--balance",type=int,default=None,help='eval epoch')
     parser.add_argument("--epoch",type=int,default=200,help='eval epoch')
+    parser.add_argument("-em","--epoch_min",type=int,default=20,help='minimum epoch threshold')
     parser.add_argument("--num_point",type=int,default=1000,help='num_point')
     parser.add_argument("--pool",type=int,default=1,help='pool')
     parser.add_argument("--depth",type=int,default=8,help='depth')
@@ -15,6 +16,7 @@ if __name__== '__main__':
     parser.add_argument("--encoder_dim",type=int,default=128,help='encoder_dim')
     parser.add_argument("--emb_dim",type=int,default=64,help='emb_dim')
     parser.add_argument("--fine_dim",type=int,default=512,help='encoder_dim')
+    parser.add_argument("--last_dim",type=int,default=64,help='encoder_dim')
     parser.add_argument("--in_channel",type=int,default=5,help='in channel')
     parser.add_argument("--group_size",type=int,default=32,help='emb_dim')
     parser.add_argument("--num_group",type=int,default=64,help='emb_dim')
@@ -68,53 +70,31 @@ class metric:
         self.metric2=MeanSquaredError(device='cuda')
         self.n=0
         self.loss=0
+        self.weight=None
     def reset(self,):
         self.n=0
         self.loss=0
         self.metric1.reset()
         self.metric2.reset()
-    def update(self,output,target,loss_item):
+        self.weight=None
+    def update(self,output,target,loss_item,weight=None):
         self.metric1.update(output[0][:].ravel(),target[0][:].ravel())
-        self.metric2.update(output[1],target[1])
+        for i in range(1,len(output)):
+            if(output[i] is None): continue
+            self.metric2.update(output[i].ravel(),target[1][:,i-1])
         self.n += len(output[0])
         self.loss+=loss_item*len(output[0])
+        self.weight=weight
     def getloss(self,):
         return self.loss/self.n
     def getdesc(self,):
-        return f"{self.name} loss=({self.loss/self.n:.4f}), auc {self.metric1.compute().item():.4f}, mse {self.metric2.compute().item():.4f}"
+        if self.weight is not None:
+            weight_text=",".join([f"{self.weight[i]:.2f}" for i in range(len(self.weight))])
+            return f"{self.name} weight=({weight_text}),loss=({self.loss/self.n:.3f}), auc {self.metric1.compute().item():.3f}, mse {self.metric2.compute().item():.3f}"
+        else:
+            return f"{self.name} loss=({self.loss/self.n:.3f}), auc {self.metric1.compute().item():.3f}, mse {self.metric2.compute().item():.3f}"
 
-class gradnorm:
-    def __init__(self,loss,alpha=0.1,l2=0.0003):
-        self.alpha=alpha
-        self.l2=l2
-        weights=torch.ones_like(loss)
-        self.weights=th.nn.Parameter(weights)
-        self.T=self.weights.sum().detach()
-        self.optimzer2 = th.optim.Adam([self.weights],lr=lr2)
-        self.l0=loss.detach
-
-    def backward(self,loss,layer):
-        weighted_loss=self.weights @ loss # matmul
-        weighted_loss.backward(retain_graph=True)
-        gw=[]
-        for i in range(len(loss)):
-            dl=th.autograd.grad(weights[i]*loss[i],layer.parameters(),retain_graph=True,create_graph=True)[0]
-            gw.append(th.norm(dl))
-        gw=th.stack(gw)
-        loss_ratio=loss.detach()/self.l0
-        rt=loss_ratio/loss_ratio.mean()
-        gw_avg=gw.mean().detach()
-        constant=(gw_avg*rt**self.alpha).detach()
-        gradnorm_loss=th.abs(gw-constant).sum()
-        self.optimizer2.zero_grad()
-        gradnorm_loss.backward()
         
-    def step():
-        self.optimizer2.step()
-        weights=(self.weights/self.weights.sum()*T).detach()
-        self.weights=th.nn.Parameters(weights)
-        self.optimizer2=th.optim.Adam([self.weights],lr=self.lr2)
-
 class model:
     def __init__(self,name,config,condor=False):
         self.config=config
@@ -146,24 +126,23 @@ class model:
                 output = self.net(X)
 
                 self.optim.zero_grad()
-                loss = self.net.get_loss(output,[Y1,Y2])
-                if(check==1):
-                    check=2
-                    gn=gradnorm(loss)
-                train_metric.update(output,[Y1,Y2],loss.item())
+                #loss.backward(retain_graph=True)
 
                 try:
                     #loss.backward()
-                    gn.backward(loss,layer)
+                    if(epoch<10):loss=self.net.get_loss(output,[Y1,Y2])
+                    else:loss=self.net.gradnorm_loss(output,[Y1,Y2])
                 except:
                     print("X",th.any(th.isnan(X)))
                     print("Y1 Y2",th.any(th.isnan(Y1)),th.any(th.isnan(Y2)))
-                    print("out",th.any(th.isnan(output[0])),th.any(th.isnan(output[1])))
+                    print("out",th.any(th.isnan(output[0])),th.any(th.isnan(th.Tensor(output[1]))))
+                    if(epoch<10):loss=self.net.get_loss(output,[Y1,Y2])
+                    else:loss=self.net.gradnorm_loss(output,[Y1,Y2])
                     print("loss",th.any(th.isnan(loss)))
-                    loss.backward()
+                    break
+                train_metric.update(output,[Y1,Y2],loss.item(),self.net.weight)
 
                 self.optim.step()
-                gn.step()
 
                 if(not self.condor):
                     bar.set_description(f"epoch{epoch:4d} : {train_metric.getdesc()} ")
@@ -198,7 +177,7 @@ class model:
                   early_stop=0
                   best_loss=val_metric.getloss()
                   self.save(epoch,best_loss)
-                if(epoch>20 and early_stop>7):break
+                if(epoch>args.epoch_min and early_stop>7):break
                 else:early_stop+=1
     def save(self,epoch,best_loss):
         if(not os.path.isdir("save")):
@@ -303,6 +282,7 @@ model:
   encoder_dims: {args.encoder_dim}
   encoder_feature: {args.encoder_feat}
   fine_dim: {args.fine_dim}
+  last_dim: {args.last_dim}
   rms_norm: False
   drop_path: 0.2
   drop_out: 0.1
